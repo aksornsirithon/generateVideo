@@ -1,6 +1,11 @@
 """
-Video Generator - Google Veo 3.1
-อ่าน prom.txt จาก Google Drive → Generate video ต่อ prompt → Upload กลับ Google Drive
+Video Generator - Google Veo 3.1 (Image-to-Video)
+อ่าน prom.txt + รูปภาพจาก Google Drive → Generate video → Upload กลับ Google Drive
+
+รูปแบบไฟล์ใน Google Drive folder:
+    prom.txt   ← prompt แต่ละบรรทัด ขึ้นด้วยเลข
+    1.jpg      ← รูปสินค้าสำหรับ prompt 1
+    2.jpg      ← รูปสินค้าสำหรับ prompt 2
 
 รูปแบบ prom.txt:
     1 สร้างวิดีโอ...หนุ่มหล่อ...
@@ -22,13 +27,14 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
 # ==================== CONFIG ====================
-GDRIVE_PROMPT_FOLDER_ID = os.environ.get("GDRIVE_PROMPT_FOLDER_ID")   # folder ที่มี prom.txt
-GDRIVE_OUTPUT_FOLDER_ID = os.environ.get("GDRIVE_OUTPUT_FOLDER_ID")   # folder เก็บวิดีโอผลลัพธ์
+GDRIVE_PROMPT_FOLDER_ID = os.environ.get("GDRIVE_PROMPT_FOLDER_ID")
+GDRIVE_OUTPUT_FOLDER_ID = os.environ.get("GDRIVE_OUTPUT_FOLDER_ID")
 GEMINI_API_KEY          = os.environ.get("GEMINI_API_KEY")
 GDRIVE_CREDENTIALS      = os.environ.get("GDRIVE_CREDENTIALS_JSON")
 
-PROMPT_FILENAME = "prom.txt"
-VEO_MODEL       = "veo-3.1-generate-preview"
+PROMPT_FILENAME  = "prom.txt"
+VEO_MODEL        = "veo-3.1-generate-preview"
+IMAGE_EXTENSIONS = ["jpg", "jpeg", "png", "webp"]
 
 # ==================== LOGGING ====================
 os.makedirs("logs", exist_ok=True)
@@ -50,30 +56,47 @@ def get_drive_service():
     )
     return build("drive", "v3", credentials=creds)
 
-def read_prompt_file_from_drive(service, folder_id, filename):
-    """ค้นหาและอ่านไฟล์ prompt จาก Google Drive"""
-    log.info(f"กำลังค้นหาไฟล์ '{filename}' ใน Google Drive...")
+def download_file_bytes(service, folder_id, filename):
+    """ค้นหาและ download ไฟล์จาก Google Drive คืนค่าเป็น bytes"""
     results = service.files().list(
         q=f"'{folder_id}' in parents and name='{filename}' and trashed=false",
-        fields="files(id, name)"
+        fields="files(id, name, mimeType)"
     ).execute()
     files = results.get("files", [])
     if not files:
-        raise FileNotFoundError(f"ไม่พบไฟล์ '{filename}' ใน folder ที่กำหนด")
-
-    file_id = files[0]["id"]
-    log.info(f"พบไฟล์: {files[0]['name']} (ID: {file_id})")
-
-    request = service.files().get_media(fileId=file_id)
+        return None, None
+    file_info = files[0]
+    request = service.files().get_media(fileId=file_info["id"])
     buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(buffer, request)
     done = False
     while not done:
         _, done = downloader.next_chunk()
+    return buffer.getvalue(), file_info.get("mimeType", "image/jpeg")
 
-    content = buffer.getvalue().decode("utf-8")
+def read_prompt_file(service, folder_id):
+    """อ่าน prom.txt จาก Google Drive"""
+    log.info(f"กำลังอ่าน '{PROMPT_FILENAME}' จาก Google Drive...")
+    data, _ = download_file_bytes(service, folder_id, PROMPT_FILENAME)
+    if data is None:
+        raise FileNotFoundError(f"ไม่พบไฟล์ '{PROMPT_FILENAME}' ใน folder")
+    content = data.decode("utf-8")
     log.info(f"อ่านไฟล์สำเร็จ ({len(content)} ตัวอักษร)")
     return content
+
+def download_image(service, folder_id, num):
+    """
+    ค้นหารูปภาพที่ชื่อตรงกับเลข prompt เช่น 1.jpg, 1.png, 1.jpeg
+    คืนค่า (bytes, mime_type) หรือ (None, None) ถ้าไม่พบ
+    """
+    for ext in IMAGE_EXTENSIONS:
+        filename = f"{num}.{ext}"
+        data, mime = download_file_bytes(service, folder_id, filename)
+        if data is not None:
+            log.info(f"โหลดรูป: {filename}")
+            return data, mime
+    log.warning(f"ไม่พบรูปภาพสำหรับ prompt [{num}] (ค้นหา: {num}.jpg/.png/.jpeg)")
+    return None, None
 
 def upload_to_drive(service, file_path, folder_id, file_name):
     log.info(f"Uploading: {file_name}")
@@ -87,44 +110,70 @@ def upload_to_drive(service, file_path, folder_id, file_name):
 
 # ==================== PARSE PROMPTS ====================
 def parse_prompts(content: str) -> list[dict]:
-    """
-    แยก prompt จากเนื้อหาไฟล์
-    รองรับรูปแบบ:
-        1 ข้อความ prompt แรก...
-        2 ข้อความ prompt สอง...
-    """
+    """แยก prompts จาก prom.txt — รูปแบบ: '1 ข้อความ...' """
     prompts = []
     for line in content.splitlines():
         line = line.strip()
         if not line:
             continue
-        # บรรทัดที่ขึ้นด้วยตัวเลขตามด้วยช่องว่าง เช่น "1 ..." หรือ "2 ..."
         parts = line.split(" ", 1)
         if len(parts) == 2 and parts[0].isdigit():
-            num   = int(parts[0])
-            text  = parts[1].strip()
-            prompts.append({"num": num, "text": text})
+            prompts.append({"num": int(parts[0]), "text": parts[1].strip()})
         else:
-            # ถ้าไม่มีเลขนำหน้า ให้ถือว่าเป็น prompt เดียว
             prompts.append({"num": len(prompts) + 1, "text": line})
 
     log.info(f"พบ {len(prompts)} prompt")
     for p in prompts:
-        log.info(f"  [{p['num']}] {p['text'][:60]}...")
+        log.info(f"  [{p['num']}] {p['text'][:70]}...")
     return prompts
 
 # ==================== VEO 3.1 ====================
-def generate_video(prompt_text: str, output_path: str):
-    """Generate วิดีโอด้วย Veo 3.1"""
-    log.info("กำลัง Generate ด้วย Veo 3.1...")
+def generate_video(prompt_text: str, image_bytes: bytes, mime_type: str, output_path: str):
+    """Generate วิดีโอด้วย Veo 3.1 image-to-video"""
+    log.info("กำลัง Generate ด้วย Veo 3.1 (image-to-video)...")
+    client = genai.Client(api_key=GEMINI_API_KEY)
+
+    # สร้าง image object จาก bytes
+    image = types.Image(image_bytes=image_bytes, mime_type=mime_type)
+
+    operation = client.models.generate_videos(
+        model=VEO_MODEL,
+        prompt=prompt_text,
+        image=image,                         # ส่งรูปสินค้าไปด้วย
+        config=types.GenerateVideosConfig(
+            aspect_ratio="9:16",             # แนวตั้ง TikTok/Reels/Shorts
+            duration_seconds="8",            # สูงสุด 8 วิ (Veo 3.1 limit)
+            number_of_videos=1,
+            resolution="720p",
+        )
+    )
+
+    log.info(f"Operation: {operation.name} | รอผล...")
+    while not operation.done:
+        time.sleep(15)
+        operation = client.operations.get(operation)
+        log.info("  ยังรอ Veo 3.1...")
+
+    if not operation.response or not operation.response.generated_videos:
+        raise Exception("Veo 3.1 ไม่มีวิดีโอในผลลัพธ์")
+
+    video = operation.response.generated_videos[0]
+    client.files.download(file=video.video)
+    video.video.save(output_path)
+    log.info(f"บันทึก: {output_path}")
+    return output_path
+
+def generate_video_text_only(prompt_text: str, output_path: str):
+    """Generate วิดีโอด้วย Veo 3.1 text-only (กรณีไม่มีรูป)"""
+    log.info("ไม่พบรูป — Generate แบบ text-to-video แทน...")
     client = genai.Client(api_key=GEMINI_API_KEY)
 
     operation = client.models.generate_videos(
         model=VEO_MODEL,
         prompt=prompt_text,
         config=types.GenerateVideosConfig(
-            aspect_ratio="9:16",   # แนวตั้ง TikTok/Reels/Shorts
-            duration_seconds="8",  # Veo 3.1 รองรับสูงสุด 8 วิ
+            aspect_ratio="9:16",
+            duration_seconds="8",
             number_of_videos=1,
             resolution="720p",
         )
@@ -151,19 +200,14 @@ def main():
     log.info(f"🎬 Veo 3.1 Generator: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log.info("=" * 55)
 
-    # 1. เชื่อมต่อ Google Drive
-    service = get_drive_service()
+    service   = get_drive_service()
+    content   = read_prompt_file(service, GDRIVE_PROMPT_FOLDER_ID)
+    prompts   = parse_prompts(content)
 
-    # 2. อ่าน prom.txt จาก Drive
-    content = read_prompt_file_from_drive(service, GDRIVE_PROMPT_FOLDER_ID, PROMPT_FILENAME)
-
-    # 3. แยก prompts
-    prompts = parse_prompts(content)
     if not prompts:
         log.warning("ไม่พบ prompt ในไฟล์")
         return
 
-    # 4. Generate วิดีโอแต่ละ prompt
     success_count = 0
     fail_count    = 0
     timestamp     = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -178,10 +222,20 @@ def main():
         output_path = f"/tmp/{output_name}"
 
         try:
-            generate_video(text, output_path)
+            # โหลดรูปที่ชื่อตรงกับเลข prompt (เช่น 1.jpg)
+            image_bytes, mime_type = download_image(service, GDRIVE_PROMPT_FOLDER_ID, num)
+
+            if image_bytes:
+                # image-to-video (มีรูปสินค้า)
+                generate_video(text, image_bytes, mime_type, output_path)
+            else:
+                # text-to-video (ไม่มีรูป)
+                generate_video_text_only(text, output_path)
+
             upload_to_drive(service, output_path, GDRIVE_OUTPUT_FOLDER_ID, output_name)
             success_count += 1
             log.info(f"✅ สำเร็จ: {output_name}")
+
         except Exception as e:
             fail_count += 1
             log.error(f"❌ Error prompt [{num}]: {e}")
